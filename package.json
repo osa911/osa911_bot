@@ -1,0 +1,18 @@
+{
+  "name": "osa911_telegram_bot",
+  "author": {
+    "name": "Yevhenii Osadchyi",
+    "email": "e.osadchuy@gmail.com"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "coingecko-api": "^1.0.10",
+    "dotenv": "^8.2.0",
+    "lowdb": "^1.0.0",
+    "telegraf": "^3.38.0",
+    "telegraf-inline-menu": "^5.3.0",
+    "telegram-keyboard": "^2.1.6"
+  }
+}
