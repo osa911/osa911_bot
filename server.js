@@ -1,43 +1,53 @@
 const dotenv = require('dotenv')
 const { Telegraf } = require('telegraf')
 const { Keyboard } = require('telegram-keyboard')
-const low = require('lowdb')
-const FileSync = require('lowdb/adapters/FileSync')
+const { Client } = require('pg')
 const CoinGecko = require('coingecko-api')
 
 dotenv.config()
 
+const dbClient = new Client({ connectionString: process.env.DATABASE_URL })
+dbClient.connect()
 const CoinGeckoClient = new CoinGecko()
-const adapter = new FileSync('XRP_invest_db.json')
-const db = low(adapter)
-db.defaults({ users: [], xrpPrice: 0 }).write()
-
 const bot = new Telegraf(process.env.BOT_TOKEN)
 
 const greenCircle = '🟢'
 const redCircle = '🔴'
+
 let interval
 
-function startSender () {
+async function startSender () {
   if (!interval) {
+    await sender()
     interval = setInterval(async () => {
-      const price = await getXRPCurrency()
-      let prevPrice = db.get(`xrpPrice`).value()
-      if (prevPrice === 0) {
-        db.set(`xrpPrice`, price).write()
-        prevPrice = price
-      }
-      const diffPercent = (price / prevPrice - 1) * 100
-      if (diffPercent > 3 || diffPercent < -3) {
-        db.set(`xrpPrice`, price).write()
-        db.get('users').value().forEach(({ chatId }) => {
-          const circle = diffPercent >= 0 ? greenCircle : redCircle
-          const text = `${circle} Price has been changed: ${round(diffPercent)}%${circle}
+      await sender()
+    }, 1000 * 60 * 60)
+  }
+}
+
+async function sender () {
+  const price = await getXRPCurrency()
+  try {
+    const { rows } = await dbClient.query('SELECT price FROM "public"."Xrp";', [])
+    const { price: dbPrice } = rows[0] || {}
+    let prevPrice = +dbPrice
+    if (!prevPrice || prevPrice === 0) {
+      await dbClient.query('INSERT INTO "public"."Xrp" (price) values ($1);', [price])
+      prevPrice = price
+    }
+    const diffPercent = (price / prevPrice - 1) * 100
+    if (diffPercent > 3 || diffPercent < -3) {
+      await dbClient.query('Update "public"."Xrp" SET price = $1;', [price])
+      const { rows } = await dbClient.query('SELECT chatid FROM "public"."Users";', [])
+      rows.forEach(({ chatid: chatId }) => {
+        const circle = diffPercent >= 0 ? greenCircle : redCircle
+        const text = `${circle} Price has been changed: ${round(diffPercent)}%${circle}
 Look at actual information:${renderShortPortfolio(price)}`
-          sendMsg(chatId, text)
-        })
-      }
-    }, 10000)
+        sendMsg(chatId, text)
+      })
+    }
+  } catch (err) {
+    console.log('sender db Error', err)
   }
 }
 
@@ -52,14 +62,15 @@ function round (number) {
 function renderShortPortfolio (price) {
   const currentDeposit = round(5488 * price)
   const diff = round(currentDeposit - 3527.60)
+  const diffPercent = round((currentDeposit / 3527.60 - 1) * 100)
+
   return `
 Депозит, USD: <b>$3527,60</b>
-Кол-во XRP: <b>5488 шт.</b>
 Депозит на сейчас: <b>$${currentDeposit}.</b>
 Курс на сейчас: <b>$${price}</b>
 ${diff >= 0
-    ? `Доход: <b>$${diff}.</b>`
-    : `Убыток: <b>$${diff * -1}</b>
+    ? `Доход: <b>$${diff} или ${diffPercent}%.</b>`
+    : `Убыток: <b>$${diff * -1} или ${diffPercent}%</b>
 `}
 `
 }
@@ -67,6 +78,8 @@ ${diff >= 0
 function renderPortfolio (price) {
   const currentDeposit = round(5488 * price)
   const diff = round(currentDeposit - 3527.60)
+  const diffPercent = round((currentDeposit / 3527.60 - 1) * 100)
+
   return `
 Бюджет, евро: <b>€3000,00</b>
 Бюджет, грн: <b>101000,00 грн.</b>
@@ -79,8 +92,8 @@ function renderPortfolio (price) {
 Депозит на сейчас: <b>$${currentDeposit}.</b>
 Курс на сейчас: <b>$${price}</b>
 ${diff >= 0
-    ? `Доход: <b>$${diff}.</b>`
-    : `Убыток: <b>$${diff * -1}</b>
+    ? `Доход: <b>$${diff} или ${diffPercent}%.</b>`
+    : `Убыток: <b>$${diff * -1} или ${diffPercent}%</b>
 `}
 `
 }
@@ -91,20 +104,42 @@ async function getXRPCurrency () {
   return usd || 0
 }
 
-function createNewUser (ctx) {
-  db.get(`users`)
-    .push({ ...ctx.from, chatId: ctx.chat.id })
-    .write()
+async function updateUserVisit (ctx) {
+  try {
+    const { rows } = await dbClient.query('SELECT request_count FROM "public"."Users" where id = $1;', [ctx.from.id])
+    const { request_count } = rows[0]
+    await dbClient.query('Update "public"."Users" SET request_count = $1 WHERE id = $2;', [+request_count + 1, ctx.from.id])
+  } catch (err) {
+    console.log('updateUserVisit db Error', err)
+  }
 }
 
-const mainMenu = (ctx, str) => {
-  if (!db.get(`users`).find({ chatId: ctx.chat.id }).value()) {
+async function createNewUser (ctx) {
+  try {
+    await dbClient.query('INSERT INTO "public"."Users" (id, is_bot, first_name, username, language_code, chatId, request_count) VALUES ($1, $2, $3, $4, $5, $6, $7);', [ctx.from.id, ctx.from.is_bot, ctx.from.first_name, ctx.from.username, ctx.from.language_code, ctx.chat.id, 0])
+  } catch (err) {
+    console.log('createNewUser db Error', err)
+  }
+}
+
+async function isChatPresent (id) {
+  try {
+    const { rowCount } = await dbClient.query('SELECT * FROM "public"."Users" where chatId = $1;', [id])
+    return rowCount
+  } catch (err) {
+    console.log('getUser db Error', err)
+  }
+}
+
+const mainMenu = async (ctx, str) => {
+  const isPresent = await isChatPresent(ctx.chat.id)
+  if (!isPresent) {
     createNewUser(ctx)
   }
 
   return ctx.replyWithHTML(
     str || `Hello ${ctx.from.first_name}, use menu for navigation.`,
-    Keyboard.builtIn(['🤪 Short status', '😎 Get me full information'], { columns: 1 })
+    Keyboard.builtIn(['🤪 Short status', '😎 Get me full information'], { columns: 1 }),
   )
 }
 
@@ -116,31 +151,30 @@ bot.start((ctx) => {
 bot.hears('🤪 Short status', async (ctx) => {
   const price = await getXRPCurrency()
   const res = await renderShortPortfolio(price)
+  await updateUserVisit(ctx)
   return mainMenu(ctx, res)
 })
 
 bot.hears('😎 Get me full information', async (ctx) => {
   const price = await getXRPCurrency()
   const res = renderPortfolio(price)
+  await updateUserVisit(ctx)
   return mainMenu(ctx, res)
 })
 
 bot.command('show', async (ctx) => {
   const price = await getXRPCurrency()
   const res = await renderShortPortfolio(price)
+  await updateUserVisit(ctx)
   return ctx.replyWithHTML(res)
 })
 
 bot.command('show_all', async (ctx) => {
   const price = await getXRPCurrency()
   const res = await renderPortfolio(price)
+  await updateUserVisit(ctx)
   return ctx.replyWithHTML(res)
 })
-
-// bot.on('text', async (ctx) => {
-//   await ctx.answerCbQuery("I don't want to speak with you human")
-//   return false
-// })
 
 bot.catch(error => {
   console.log('telegraf error', error.response, error.parameters, error.on || error)
