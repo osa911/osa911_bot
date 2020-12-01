@@ -13,7 +13,7 @@ app.get('/', (req, res) => {
 })
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`App started on http://localhost:${port}`)
+  console.log(`App started on http://localhost:${process.env.PORT || 3000}`)
 
   const dbClient = new Client({ connectionString: process.env.DATABASE_URL })
   dbClient.connect()
